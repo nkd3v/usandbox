@@ -14,6 +14,8 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <!-- The WebView2 package also ships a WPF control this app does not use. -->
     <NoWarn>$(NoWarn);MSB3277</NoWarn>
+    <!-- `dotnet publish` puts usandbox.exe and its files in dist/ at the repository root. -->
+    <PublishDir>$(MSBuildThisFileDirectory)..\..\dist\</PublishDir>
   </PropertyGroup>
 
   <ItemGroup>

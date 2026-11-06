@@ -14,16 +14,16 @@ everything it does on the network, including HTTPS, without installing a certifi
 - **WebView2 window** with live traffic, request/response details, endpoints, a rules editor and the
   sandbox's processes. A console mode (`--no-gui`) is also available.
 
-`usandbox.ps1`, the original script, is still here. It does the throwaway-account part only, with no
-network features and nothing to build.
+usandbox is developed as a C# (.NET 9) app in `src/USandbox`. The earlier PowerShell script,
+`usandbox.ps1`, has been removed; it is in the Git history if you need it.
 
 ## Build
 
 Needs Windows 10/11 x64, the .NET 9 SDK, and the Microsoft Edge WebView2 Runtime (already installed
-with Edge on current Windows).
+with Edge on current Windows). Publishing writes to `dist\` at the repository root:
 
 ```bash
-dotnet publish src/USandbox -c Release -o dist
+dotnet publish src/USandbox -c Release
 ```
 
 `dist\usandbox.exe` is the program. The machine that runs it needs the .NET 9 Desktop Runtime.
@@ -164,9 +164,8 @@ never held back. See `src/USandbox/rules.example.json` for more.
 - Loopback (127.0.0.1, ::1) is not blocked, so the program can reach services listening locally.
 - The firewall lock is per account. It is not a security boundary against a program that can escalate
   privileges.
-- If usandbox is killed, the WFP filters disappear with it, but the account may be left behind, as with
-  the original script. It is named `usbx-…`, with the description "Throwaway account created by
-  usandbox".
+- If usandbox is killed, the WFP filters disappear with it, but the account may be left behind. It is
+  named `usbx-…`, with the description "Throwaway account created by usandbox".
 
 ## Testing aids
 

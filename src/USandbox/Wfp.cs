@@ -21,9 +21,10 @@ sealed class WfpEgressLock : IDisposable
     static readonly Guid LayerRecvAcceptV6 = new("a3b42c97-9f04-4672-b87e-cee9c483257f");
     static readonly Guid ConditionAleUserId = new("af043a0a-b34d-4f86-979c-c90371af6e66");
     static readonly Guid ConditionFlags = new("632ce23b-5167-435c-86d7-e903684aa80c");
+    static readonly Guid ConditionProtocol = new("3971ef2b-623e-4f9a-8cb1-6e79b806b9a7");
 
     const int FWP_UINT8 = 1, FWP_UINT32 = 3, FWP_SECURITY_DESCRIPTOR_TYPE = 14;
-    const int FWP_MATCH_EQUAL = 0, FWP_MATCH_FLAGS_NONE_SET = 8;
+    const int FWP_MATCH_EQUAL = 0, FWP_MATCH_FLAGS_NONE_SET = 8, FWP_MATCH_NOT_EQUAL = 10;
     const uint FWP_CONDITION_FLAG_IS_LOOPBACK = 0x1;
     const uint FWP_ACTION_BLOCK = 0x1001;
     const int FWPM_NET_EVENT_TYPE_CLASSIFY_DROP = 3;
@@ -40,7 +41,11 @@ sealed class WfpEgressLock : IDisposable
     /// <summary>False when Windows is configured not to record firewall drops, so none can be reported.</summary>
     public bool ReportsDrops { get; }
 
-    public WfpEgressLock(string sid, string name)
+    /// <param name="allowTcp">
+    /// Transparent capture: TCP connections are let through here because the redirector turns every
+    /// one of them around to the proxy; everything else (UDP, ICMP, ...) is still blocked.
+    /// </param>
+    public WfpEgressLock(string sid, string name, bool allowTcp = false)
     {
         IntPtr session = Alloc(72);
         Marshal.WriteIntPtr(session, 16, Str(name));
@@ -67,7 +72,7 @@ sealed class WfpEgressLock : IDisposable
             Marshal.WriteInt32(sdBlob, 0, sdBytes.Length);
             Marshal.WriteIntPtr(sdBlob, 8, sdData);
 
-            IntPtr conditions = Alloc(2 * 40);
+            IntPtr conditions = Alloc(3 * 40);
             WriteGuid(conditions, 0, ConditionAleUserId);
             Marshal.WriteInt32(conditions, 16, FWP_MATCH_EQUAL);
             Marshal.WriteInt32(conditions, 24, FWP_SECURITY_DESCRIPTOR_TYPE);
@@ -79,21 +84,16 @@ sealed class WfpEgressLock : IDisposable
             Marshal.WriteInt32(conditions, 40 + 24, FWP_UINT32);
             Marshal.WriteInt32(conditions, 40 + 32, (int)FWP_CONDITION_FLAG_IS_LOOPBACK);
 
-            foreach (var layer in new[] { LayerConnectV4, LayerConnectV6, LayerRecvAcceptV4, LayerRecvAcceptV6 })
-            {
-                IntPtr filter = Alloc(200);
-                WriteGuid(filter, 0, Guid.NewGuid());
-                Marshal.WriteIntPtr(filter, 16, Str(name));
-                WriteGuid(filter, 64, layer);
-                WriteGuid(filter, 80, subLayerKey);
-                Marshal.WriteInt32(filter, 96, FWP_UINT8);
-                Marshal.WriteByte(filter, 104, 15);
-                Marshal.WriteInt32(filter, 112, 2);
-                Marshal.WriteIntPtr(filter, 120, conditions);
-                Marshal.WriteInt32(filter, 128, unchecked((int)FWP_ACTION_BLOCK));
-                Native.CheckFwp(Native.FwpmFilterAdd0(engine, filter, IntPtr.Zero, out ulong id), "FwpmFilterAdd0");
-                filterIds.Add(id);
-            }
+            // Condition 3 (transparent capture only, outgoing only): it is not TCP.
+            WriteGuid(conditions, 80, ConditionProtocol);
+            Marshal.WriteInt32(conditions, 80 + 16, FWP_MATCH_NOT_EQUAL);
+            Marshal.WriteInt32(conditions, 80 + 24, FWP_UINT8);
+            Marshal.WriteByte(conditions, 80 + 32, 6);
+
+            foreach (var layer in new[] { LayerConnectV4, LayerConnectV6 })
+                AddFilter(name, layer, subLayerKey, conditions, allowTcp ? 3 : 2, FWP_ACTION_BLOCK);
+            foreach (var layer in new[] { LayerRecvAcceptV4, LayerRecvAcceptV6 })
+                AddFilter(name, layer, subLayerKey, conditions, 2, FWP_ACTION_BLOCK);
 
             ReportsDrops = CollectsNetEvents();
             if (ReportsDrops)
@@ -111,6 +111,22 @@ sealed class WfpEgressLock : IDisposable
             Dispose();
             throw;
         }
+    }
+
+    void AddFilter(string name, Guid layer, Guid subLayerKey, IntPtr conditions, int conditionCount, uint action)
+    {
+        IntPtr filter = Alloc(200);
+        WriteGuid(filter, 0, Guid.NewGuid());
+        Marshal.WriteIntPtr(filter, 16, Str(name));
+        WriteGuid(filter, 64, layer);
+        WriteGuid(filter, 80, subLayerKey);
+        Marshal.WriteInt32(filter, 96, FWP_UINT8);
+        Marshal.WriteByte(filter, 104, 15);
+        Marshal.WriteInt32(filter, 112, conditionCount);
+        Marshal.WriteIntPtr(filter, 120, conditions);
+        Marshal.WriteInt32(filter, 128, unchecked((int)action));
+        Native.CheckFwp(Native.FwpmFilterAdd0(engine, filter, IntPtr.Zero, out ulong id), "FwpmFilterAdd0");
+        filterIds.Add(id);
     }
 
     bool CollectsNetEvents()

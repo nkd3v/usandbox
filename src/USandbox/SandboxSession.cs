@@ -15,6 +15,13 @@ enum StageMode { None, File, Folder }
 /// </summary>
 enum NetworkMode { Filter, Open, Off, None }
 
+/// <summary>
+/// How the program's traffic reaches the proxy in filter mode.
+/// transparent: every TCP connection is redirected to the proxy (WinDivert), whatever the program does.
+/// proxy:       the program is told to use the proxy (proxy settings); anything else is blocked.
+/// </summary>
+enum CaptureMode { Transparent, Proxy }
+
 sealed class SessionOptions
 {
     public string Program { get; set; } = "";
@@ -25,6 +32,13 @@ sealed class SessionOptions
     public NetworkMode Network { get; set; } = NetworkMode.Filter;
     public bool InspectTls { get; set; } = true;
     public bool AutoPassthrough { get; set; } = true;
+    public CaptureMode Capture { get; set; } = CaptureMode.Transparent;
+    /// <summary>With transparent capture, also set the proxy settings (off by default: they tell a program it is watched).</summary>
+    public bool ProxySettings { get; set; }
+    /// <summary>Decrypt passed-through TLS with keys read from the program's memory.</summary>
+    public bool ExtractKeys { get; set; } = true;
+    /// <summary>Never impersonate servers (no usandbox CA): pass all TLS through and decrypt it with keys from memory.</summary>
+    public bool PassiveTls { get; set; }
 }
 
 /// <summary>One run: create the account, set up the network, run the program, wait, clean up.</summary>
@@ -42,6 +56,9 @@ sealed class SandboxSession
     public int? MainPid { get; private set; }
     public int? ExitCode { get; private set; }
     public int? ProxyPort { get; private set; }
+    public bool Transparent { get; private set; }
+    /// <summary>Log every redirected connection (testing aid, set with --transcript).</summary>
+    public bool Verbose { get; set; }
     public IReadOnlyList<SandboxProcessInfo> Processes { get; private set; } = Array.Empty<SandboxProcessInfo>();
     public SessionOptions Options => options;
 
@@ -63,6 +80,8 @@ sealed class SandboxSession
 
         SandboxAccount? account = null;
         ProxyServer? proxy = null;
+        Redirector? redirector = null;
+        KeyExtractor? extractor = null;
         CertificateAuthority? ca = null;
         WfpEgressLock? egress = null;
         SandboxProcess? main = null;
@@ -104,16 +123,55 @@ sealed class SandboxSession
             // --- Network ---------------------------------------------------------------------
             if (options.Network is NetworkMode.Filter or NetworkMode.Open)
             {
-                proxy = new ProxyServer(monitor, rules, account.Sid) { InspectTls = options.InspectTls, AutoPassthrough = options.AutoPassthrough };
-                ProxyPort = proxy.Port;
-                var env = new Dictionary<string, string>
+                bool inspect = options.InspectTls && !options.PassiveTls;
+                proxy = new ProxyServer(monitor, rules, account.Sid)
                 {
-                    ["HTTP_PROXY"] = $"http://127.0.0.1:{proxy.Port}",
-                    ["HTTPS_PROXY"] = $"http://127.0.0.1:{proxy.Port}",
-                    ["ALL_PROXY"] = $"http://127.0.0.1:{proxy.Port}",
-                    ["NODE_USE_ENV_PROXY"] = "1",
+                    InspectTls = inspect, AutoPassthrough = options.AutoPassthrough, PassiveTls = options.PassiveTls,
                 };
-                if (options.InspectTls)
+                ProxyPort = proxy.Port;
+
+                if (options.ExtractKeys || options.PassiveTls)
+                {
+                    if (KeyExtractor.EnableDebugPrivilege())
+                    {
+                        extractor = new KeyExtractor(monitor, rules);
+                        proxy.Extractor = extractor;
+                        monitor.Info("TLS that is passed through is decrypted with keys found in the program's memory (observed, not blockable).");
+                    }
+                    else monitor.Warn("Could not enable SeDebugPrivilege, so TLS keys cannot be read from the program's memory.");
+                }
+
+                if (options.Network == NetworkMode.Filter && options.Capture == CaptureMode.Transparent)
+                {
+                    var ports = proxy.BindTransparent();
+                    string sid = account.Sid;
+                    redirector = Redirector.TryStart(ports.Port4, ports.Port6, pid => ProcessInfo.GetOwnerSid(pid) == sid, monitor.Warn, out string? why);
+                    if (redirector == null)
+                        monitor.Warn($"Transparent capture is not available ({why}). Falling back to proxy settings: programs that ignore them are blocked, not captured.");
+                    else
+                    {
+                        proxy.Redirector = redirector;
+                        redirectorRef = redirector;
+                        int shown = 0;
+                        redirector.Redirected += r =>
+                        {
+                            if (Interlocked.Increment(ref shown) <= (Verbose ? 1000 : 3)) monitor.Info($"Redirecting PID {r.Pid}: {r.Client} -> {r.Original}.");
+                        };
+                        Transparent = true;
+                        monitor.Info("Transparent capture: every TCP connection the program makes is redirected through usandbox, whether or not it uses proxy settings.");
+                    }
+                }
+
+                var env = new Dictionary<string, string>();
+                bool proxySettings = !Transparent || options.ProxySettings;
+                if (proxySettings)
+                {
+                    env["HTTP_PROXY"] = $"http://127.0.0.1:{proxy.Port}";
+                    env["HTTPS_PROXY"] = $"http://127.0.0.1:{proxy.Port}";
+                    env["ALL_PROXY"] = $"http://127.0.0.1:{proxy.Port}";
+                    env["NODE_USE_ENV_PROXY"] = "1";
+                }
+                if (inspect)
                 {
                     ca = new CertificateAuthority(account.UserName, proxy.CrlUrl);
                     proxy.Ca = ca;
@@ -125,24 +183,30 @@ sealed class SandboxSession
                     env["SSL_CERT_FILE"] = bundleFile;
                     env["REQUESTS_CA_BUNDLE"] = bundleFile;
                     env["NODE_EXTRA_CA_CERTS"] = caFile;
-                    env["JAVA_TOOL_OPTIONS"] = "-Djavax.net.ssl.trustStoreType=Windows-ROOT -Djava.net.useSystemProxies=true";
+                    env["JAVA_TOOL_OPTIONS"] = "-Djavax.net.ssl.trustStoreType=Windows-ROOT" + (proxySettings ? " -Djava.net.useSystemProxies=true" : "");
                     monitor.Info($"HTTPS inspection: per-run CA \"{ca.Certificate.GetNameInfo(System.Security.Cryptography.X509Certificates.X509NameType.SimpleName, false)}\" " +
                                  $"is trusted by {account.UserName} only (thumbprint {ca.Certificate.Thumbprint}).");
                 }
-                account.ConfigureProxy(proxy.Port, env);
+                else if (options.PassiveTls)
+                {
+                    monitor.Info("Passive TLS: no certificate is installed and no server is impersonated; HTTPS is decrypted only from memory keys.");
+                }
+                if (proxySettings) account.ConfigureProxy(proxy.Port, env);
+                else if (env.Count > 0) account.SetEnvironment(env);
                 proxy.Start();
-                monitor.Info($"Proxy listening on 127.0.0.1:{proxy.Port}.");
+                monitor.Info(proxySettings ? $"Proxy listening on 127.0.0.1:{proxy.Port}." : "No proxy settings were given to the program.");
             }
 
             if (options.Network is NetworkMode.Filter or NetworkMode.None)
             {
-                egress = new WfpEgressLock(account.Sid, $"usandbox {account.UserName}");
+                egress = new WfpEgressLock(account.Sid, $"usandbox {account.UserName}", allowTcp: Transparent);
                 egress.Blocked += OnBlocked;
-                monitor.Info(options.Network == NetworkMode.None
-                    ? "Network locked: the program can only reach loopback addresses."
+                monitor.Info(options.Network == NetworkMode.None ? "Network locked: the program can only reach loopback addresses."
+                    : Transparent ? "Network locked: TCP goes through usandbox; UDP and everything else is blocked."
                     : "Network locked: the program can only reach the internet through the proxy.");
                 if (!egress.ReportsDrops) monitor.Warn("Windows is not recording firewall events, so blocked direct connections will not be listed.");
             }
+            if (Transparent) proxy!.StartTransparent();
 
             // --- Run -------------------------------------------------------------------------
             string workingDirectory = options.WorkingDirectory ?? Path.GetDirectoryName(program)!;
@@ -200,8 +264,11 @@ sealed class SandboxSession
             }
             if (main != null && ExitCode == null && main.HasExited) ExitCode = main.ExitCode;
             main?.Dispose();
+            if (redirector != null) monitor.Info($"Transparent capture: {redirector.Stats}.");
+            redirector?.Dispose();
             egress?.Dispose();
             proxy?.Dispose();
+            extractor?.Dispose();
             ca?.Dispose();
             account?.Delete(monitor.Warn);
             if (stageDir != null)
@@ -256,17 +323,25 @@ sealed class SandboxSession
                 continue;
             }
             if (IPAddress.IsLoopback(row.Remote.Address) || row.Remote.Address.Equals(IPAddress.Any) || row.Remote.Address.Equals(IPAddress.IPv6Any)) continue;
+            if (Transparent && (redirectorRef?.IsRedirected(row.Local, Normalize(row.Remote)) ?? false)) continue;
             string key = $"{row.Pid}|{row.Local}|{row.Remote}";
             if (!seenDirect.Add(key)) continue;
             var direct = new Flow
             {
                 Kind = "direct", Pid = row.Pid, Process = owner.Name, Host = row.Remote.Address.ToString(), Port = row.Remote.Port,
-                Outcome = "allowed", Note = "Direct TCP connection that did not use the proxy (contents not visible).",
+                Outcome = "allowed",
+                Note = Transparent ? "Direct TCP connection that was NOT redirected through usandbox (contents not visible)."
+                                   : "Direct TCP connection that did not use the proxy (contents not visible).",
             };
+            if (Transparent && row.State != TcpRow.Established) { seenDirect.Remove(key); continue; }   // still being set up
             monitor.Add(direct);
             monitor.Complete(direct);
         }
     }
+
+    Redirector? redirectorRef;
+
+    static IPEndPoint Normalize(IPEndPoint e) => e.Address.IsIPv4MappedToIPv6 ? new IPEndPoint(e.Address.MapToIPv4(), e.Port) : e;
 
     void OnBlocked(BlockedConnection b)
     {

@@ -25,6 +25,8 @@
   <ItemGroup>
     <Content Include="ui\**\*" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="rules.example.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../../third_party/WinDivert/WinDivert.dll" Link="WinDivert.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../../third_party/WinDivert/WinDivert64.sys" Link="WinDivert64.sys" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

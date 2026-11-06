@@ -103,6 +103,8 @@ sealed class MainForm : Form
         arguments = session.Options.Arguments,
         network = session.Options.Network.ToString().ToLowerInvariant(),
         inspectTls = session.Options.InspectTls,
+        passiveTls = session.Options.PassiveTls,
+        transparent = session.Transparent,
         pid = session.MainPid,
         exitCode = session.ExitCode,
         proxyPort = session.ProxyPort,
@@ -131,6 +133,8 @@ sealed class MainForm : Form
                             network = options.Session.Network.ToString().ToLowerInvariant(),
                             inspectTls = options.Session.InspectTls,
                             autoPassthrough = options.Session.AutoPassthrough,
+                            extractKeys = options.Session.ExtractKeys,
+                            passiveTls = options.Session.PassiveTls,
                             workingDirectory = options.Session.WorkingDirectory,
                         },
                         rules = rules.Current.ToJson(),
@@ -150,6 +154,10 @@ sealed class MainForm : Form
                         Network = Enum.Parse<NetworkMode>((string?)msg["network"] ?? "filter", true),
                         InspectTls = (bool?)msg["inspectTls"] ?? true,
                         AutoPassthrough = (bool?)msg["autoPassthrough"] ?? true,
+                        ExtractKeys = (bool?)msg["extractKeys"] ?? true,
+                        PassiveTls = (bool?)msg["passiveTls"] ?? false,
+                        Capture = options.Session.Capture,
+                        ProxySettings = options.Session.ProxySettings,
                         WorkingDirectory = string.IsNullOrWhiteSpace((string?)msg["workingDirectory"]) ? null : ((string?)msg["workingDirectory"])!.Trim().Trim('"'),
                     };
                     StartSession(s);

@@ -55,7 +55,7 @@
         <label class="field">
           <span>Network</span>
           <select id="fNetwork">
-            <option value="filter">Filter: everything goes through the proxy</option>
+            <option value="filter">Filter: every connection goes through usandbox</option>
             <option value="open">Open: proxy, but direct connections allowed</option>
             <option value="off">Off: no proxy (direct connections listed)</option>
             <option value="none">None: no network</option>
@@ -66,6 +66,8 @@
       <div class="checks">
         <label><input type="checkbox" id="fTls" checked> Decrypt HTTPS so content rules apply to it</label>
         <label><input type="checkbox" id="fAuto" checked> If a program rejects the certificate, stop decrypting that host</label>
+        <label><input type="checkbox" id="fKeys" checked> Decrypt TLS that is passed through with keys read from the program&rsquo;s memory</label>
+        <label><input type="checkbox" id="fPassive"> Passive TLS: never impersonate servers or install a certificate (memory keys only)</label>
       </div>
       <p class="note" id="tlsNote">usandbox makes a new certificate authority for each run. Only the throwaway account trusts it, its private key stays in memory, and it is deleted with the account. Nothing is added to your account's or the machine's certificate stores.</p>
       <div class="go"><button class="primary" type="submit">Run in sandbox</button></div>

@@ -14,6 +14,8 @@ sealed class AppOptions
     public string? LogPath { get; set; }
     /// <summary>Hidden testing aid: exposes the WebView2 page on a DevTools port.</summary>
     public int? UiDebugPort { get; set; }
+    /// <summary>Hidden testing aid: also write the console output to this file.</summary>
+    public string? TranscriptPath { get; set; }
 }
 
 /// <summary>The current rules, shared by the proxy and the GUI; edits apply to new requests immediately.</summary>
@@ -62,10 +64,18 @@ static class CommandLine
                                      open              proxy is set up, direct connections are allowed (listed)
                                      off               no proxy, no blocking (direct connections listed)
                                      none              no network except loopback
-          --no-tls-inspect           do not decrypt HTTPS: only host names are visible and only
-                                     host rules apply to HTTPS
+          --capture <how>            how traffic reaches usandbox in filter mode:
+                                     transparent (default)  every TCP connection is redirected,
+                                                            even from programs that ignore proxy
+                                                            settings (needs WinDivert next to the exe)
+                                     proxy                  proxy settings only; others are blocked
+          --proxy-settings           with transparent capture, also set proxy settings for the program
+          --no-tls-inspect           do not decrypt HTTPS by impersonating servers
+          --passive-tls              never impersonate servers or install a certificate; decrypt
+                                     HTTPS only with keys read from the program's memory
+          --no-extract-keys          do not read TLS keys from the program's memory
           --strict-tls               if a program rejects the usandbox certificate, keep failing
-                                     instead of passing that host through undecrypted
+                                     instead of passing that host through
           --rules <file>             rules file (default: %APPDATA%\usandbox\rules.json)
           --log <file>               append every request/connection as a JSON line
           --no-gui                   console only; Ctrl+C stops the program and cleans up
@@ -87,12 +97,17 @@ static class CommandLine
                 case "--cwd": o.Session.WorkingDirectory = Path.GetFullPath(Next(a)); break;
                 case "--network": o.Session.Network = Enum.Parse<NetworkMode>(Next(a), true); break;
                 case "--no-tls-inspect": o.Session.InspectTls = false; break;
+                case "--capture": o.Session.Capture = Enum.Parse<CaptureMode>(Next(a), true); break;
+                case "--proxy-settings": o.Session.ProxySettings = true; break;
+                case "--passive-tls": o.Session.PassiveTls = true; break;
+                case "--no-extract-keys": o.Session.ExtractKeys = false; break;
                 case "--strict-tls": o.Session.AutoPassthrough = false; break;
                 case "--rules": o.RulesPath = Path.GetFullPath(Next(a)); break;
                 case "--log": o.LogPath = Path.GetFullPath(Next(a)); break;
                 case "--no-gui": o.NoGui = true; break;
                 case "--pause": o.Pause = true; break;
                 case "--ui-debug-port": o.UiDebugPort = int.Parse(Next(a)); break;
+                case "--transcript": o.TranscriptPath = Path.GetFullPath(Next(a)); break;
                 case "-h": case "--help": case "-?": throw new HelpRequested();
                 default: throw new ArgumentException($"Unknown option {a}.");
             }
@@ -130,6 +145,7 @@ static class Program
     static int Main(string[] args)
     {
         if (args.Length > 0 && args[0].Equals("--proxy-only", StringComparison.OrdinalIgnoreCase)) return RunProxyOnly(args[1..]);
+        if (args.Length > 0 && args[0].Equals("--selftest", StringComparison.OrdinalIgnoreCase)) { Console(attachOnly: false); return SelfTest.Run(); }
 
         AppOptions options;
         try { options = CommandLine.Parse(args); }
@@ -238,8 +254,13 @@ static class Program
         string sid = WindowsIdentity.GetCurrent().User!.Value;
         using var proxy = new ProxyServer(monitor, () => rules.Current, sid)
         {
-            InspectTls = options.Session.InspectTls, AutoPassthrough = options.Session.AutoPassthrough,
+            InspectTls = options.Session.InspectTls && !options.Session.PassiveTls, AutoPassthrough = options.Session.AutoPassthrough,
+            PassiveTls = options.Session.PassiveTls,
         };
+        // Same-user processes can be read without SeDebugPrivilege, so key extraction works here unelevated.
+        KeyExtractor.EnableDebugPrivilege();
+        using var extractor = options.Session.ExtractKeys || options.Session.PassiveTls ? new KeyExtractor(monitor, () => rules.Current) : null;
+        proxy.Extractor = extractor;
         using var ca = new CertificateAuthority("proxy-only", proxy.CrlUrl);
         proxy.Ca = ca;
         string caFile = Path.Combine(Path.GetTempPath(), "usandbox-proxy-only-ca.pem");
@@ -275,6 +296,12 @@ static class Program
             if (rules.Current.Rules.Count > 0) System.Console.WriteLine($"Loaded {rules.Current.Rules.Count} rule(s) from {rules.Path}.");
             using var monitor = new Monitor(options.LogPath);
             PrintTo(monitor);
+            if (options.TranscriptPath != null)
+            {
+                var transcript = new StreamWriter(options.TranscriptPath, append: true) { AutoFlush = true };
+                monitor.Logged += l => { lock (transcript) transcript.WriteLine($"{l.Time:HH:mm:ss} {l.Level} {l.Text}"); };
+                monitor.FlowCompleted += f => { lock (transcript) transcript.WriteLine($"{f.Time:HH:mm:ss} flow {f.Outcome} {f.Kind} {f.Url ?? $"{f.Host}:{f.Port}"} [{f.Process}] {f.Note}"); };
+            }
 
             using var stop = new CancellationTokenSource();
             System.Console.CancelKeyPress += (_, e) =>
@@ -283,7 +310,7 @@ static class Program
                 System.Console.WriteLine("Stopping...");
                 stop.Cancel();
             };
-            var session = new SandboxSession(options.Session, monitor, () => rules.Current);
+            var session = new SandboxSession(options.Session, monitor, () => rules.Current) { Verbose = options.TranscriptPath != null };
             System.Console.WriteLine("Press Ctrl+C to stop the program and clean up.");
             session.RunAsync(stop.Token).GetAwaiter().GetResult();
             code = session.ExitCode ?? 1;

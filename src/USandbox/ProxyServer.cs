@@ -36,6 +36,51 @@ sealed class ProxyServer : IDisposable
 
     public string CrlUrl => $"http://127.0.0.1:{Port}{CrlPath}";
 
+    /// <summary>When set, TLS that is passed through is recorded and decrypted with keys from the program's memory.</summary>
+    public KeyExtractor? Extractor { get; set; }
+
+    /// <summary>Never decrypt by impersonating servers; pass all TLS through and rely on <see cref="Extractor"/>.</summary>
+    public bool PassiveTls { get; set; }
+
+    /// <summary>Set for transparent capture: tells where redirected connections were going.</summary>
+    public Redirector? Redirector { get; set; }
+
+    Socket? transparent4, transparent6;
+
+    /// <summary>
+    /// Reserves the loopback ports redirected connections arrive on (IPv4 and IPv6) without listening yet.
+    /// </summary>
+    public (int Port4, int Port6) BindTransparent()
+    {
+        transparent4 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        transparent4.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        int port4 = ((IPEndPoint)transparent4.LocalEndPoint!).Port;
+        transparent6 = new Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp);
+        transparent6.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, true);
+        try { transparent6.Bind(new IPEndPoint(IPAddress.IPv6Loopback, port4)); }
+        catch (SocketException) { transparent6.Bind(new IPEndPoint(IPAddress.IPv6Loopback, 0)); }
+        return (port4, ((IPEndPoint)transparent6.LocalEndPoint!).Port);
+    }
+
+    public void StartTransparent()
+    {
+        foreach (var socket in new[] { transparent4, transparent6 })
+        {
+            if (socket == null) continue;
+            socket.Listen(512);
+            _ = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    Socket accepted;
+                    try { accepted = await socket.AcceptAsync(cts.Token); }
+                    catch { break; }
+                    _ = Task.Run(() => HandleTransparentAsync(accepted));
+                }
+            });
+        }
+    }
+
     public ProxyServer(Monitor monitor, Func<RuleSet> rules, string sandboxSid)
     {
         this.monitor = monitor;
@@ -105,6 +150,43 @@ sealed class ProxyServer : IDisposable
             {
                 monitor.Error($"Proxy error: {e}");
             }
+        }
+    }
+
+    async Task HandleTransparentAsync(Socket socket)
+    {
+        var ct = cts.Token;
+        using var tcp = new TcpClient { Client = socket };
+        try
+        {
+            tcp.NoDelay = true;
+            var redirected = Redirector?.Lookup((IPEndPoint)socket.RemoteEndPoint!);
+            if (redirected == null) return;   // not a redirected connection
+            var client = new Client { Pid = redirected.Pid, Trusted = true };
+            client.Process = processNames.GetOrAdd(redirected.Pid, p =>
+            {
+                try { using var proc = Process.GetProcessById(p); return proc.ProcessName; } catch { return $"pid {p}"; }
+            });
+            string ip = redirected.Original.Address.ToString();
+            int port = redirected.Original.Port;
+            string shown = Redirector!.NameOf(redirected.Original.Address) ?? ip;
+            var flow = NewFlow(client, "tunnel", shown, port);
+            flow.Url = $"{shown}:{port}";
+            flow.Note = (shown == ip ? $"redirected connection to {ip}:{port}" : $"redirected connection to {ip}:{port} ({shown} by DNS)") + $" from port {redirected.Client.Port}";
+
+            var rule = rules().MatchConnection(shown);
+            if (rule == null && shown != ip) rule = rules().MatchConnection(ip);
+            if (rule?.Action == "block") { Block(flow, rule, null); return; }
+
+            var stream = tcp.GetStream();
+            await HandleTunnelAsync(client, flow, rule, new HttpReader(stream), stream, ip, port, ct);
+        }
+        catch (Exception e) when (e is IOException or SocketException or OperationCanceledException or ObjectDisposedException or AuthenticationException)
+        {
+        }
+        catch (Exception e)
+        {
+            monitor.Error($"Proxy error (redirected connection): {e}");
         }
     }
 
@@ -193,6 +275,16 @@ sealed class ProxyServer : IDisposable
         }
 
         await stream.WriteAsync("HTTP/1.1 200 Connection Established\r\n\r\n"u8.ToArray(), ct);
+        await HandleTunnelAsync(client, flow, rule, reader, stream, host, port, ct);
+    }
+
+    /// <summary>
+    /// A byte stream from the program to <paramref name="host"/>:<paramref name="port"/> (a CONNECT
+    /// tunnel, or a redirected connection): decides between decrypting, passing through and reading HTTP.
+    /// </summary>
+    async Task HandleTunnelAsync(Client client, Flow flow, Rule? rule, HttpReader reader, NetworkStream stream, string host, int port, CancellationToken ct)
+    {
+        var started = Stopwatch.StartNew();
 
         // Look at what the program sends first. Some protocols wait for the server to speak, so do not wait forever.
         bool gotData;
@@ -205,7 +297,8 @@ sealed class ProxyServer : IDisposable
         if (reader.Buffered.Length == 0)
         {
             if (!gotData) return; // closed without sending anything
-            await RawTunnelAsync(flow, reader, stream, host, port, "the program waited for the server to speak first", ct);
+            if (flow.Method == null) flow.Kind = "tcp";
+            await RawTunnelAsync(flow, reader, stream, host, port, "the program waited for the server to speak first", ct, capture: true);
             return;
         }
 
@@ -214,7 +307,8 @@ sealed class ProxyServer : IDisposable
             int recordLength = TlsClientHello.RecordLength(reader.Buffered.Span);
             if (recordLength > 0) await reader.EnsureAsync(recordLength, ct);
             var (sni, alpn) = TlsClientHello.Parse(reader.Buffered.Span);
-            string name = string.IsNullOrEmpty(sni) ? host : sni;
+            string name = string.IsNullOrEmpty(sni) ? (flow.Host.Length > 0 ? flow.Host : host) : sni;
+            if (sni != null) { flow.Host = sni; flow.Url = $"{sni}:{port}"; }
             if (sni != null && !sni.Equals(host, StringComparison.OrdinalIgnoreCase))
             {
                 var sniRule = rules().MatchConnection(sni);
@@ -224,6 +318,7 @@ sealed class ProxyServer : IDisposable
 
             string key = $"{name}:{port}";
             string? passthroughWhy =
+                PassiveTls ? "passive TLS mode" :
                 !InspectTls || Ca == null ? "TLS inspection is off" :
                 rule?.Action == "passthrough" ? $"rule: {rule.Describe()}" :
                 autoPassthrough.TryGetValue(key, out var why) ? why :
@@ -232,8 +327,9 @@ sealed class ProxyServer : IDisposable
 
             if (passthroughWhy != null)
             {
-                flow.Note = $"TLS{(sni != null ? $", server name {sni}" : "")}; not decrypted: {passthroughWhy}";
-                await RawTunnelAsync(flow, reader, stream, host, port, null, ct);
+                flow.Note = (flow.Note == null ? "" : flow.Note + "; ") + $"TLS{(sni != null ? $", server name {sni}" : "")}; not intercepted: {passthroughWhy}";
+                TlsRecording? recording = Extractor != null ? new TlsRecording(flow, name, Math.Max(rules().MaxInspectBytes, 1 << 20)) : null;
+                await RawTunnelAsync(flow, reader, stream, host, port, null, ct, recording: recording);
                 return;
             }
 
@@ -248,7 +344,8 @@ sealed class ProxyServer : IDisposable
             return;
         }
 
-        await RawTunnelAsync(flow, reader, stream, host, port, "not HTTP or TLS", ct);
+        if (flow.Method == null) flow.Kind = "tcp";
+        await RawTunnelAsync(flow, reader, stream, host, port, "not HTTP or TLS", ct, capture: true);
     }
 
     static bool LooksLikeHttp(ReadOnlySpan<byte> data)
@@ -326,7 +423,10 @@ sealed class ProxyServer : IDisposable
 
     // ---- raw tunnels -------------------------------------------------------------------------
 
-    async Task RawTunnelAsync(Flow flow, HttpReader reader, Stream clientStream, string host, int port, string? why, CancellationToken ct)
+    /// <param name="capture">keep the first bytes of each direction for display (unknown protocols)</param>
+    /// <param name="recording">record TLS for decryption with keys from memory</param>
+    async Task RawTunnelAsync(Flow flow, HttpReader reader, Stream clientStream, string host, int port, string? why, CancellationToken ct,
+                              bool capture = false, TlsRecording? recording = null)
     {
         var started = Stopwatch.StartNew();
         flow.Outcome = "passthrough";
@@ -349,22 +449,55 @@ sealed class ProxyServer : IDisposable
             return;
         }
 
+        MemoryStream? sentData = capture ? new() : null, receivedData = capture ? new() : null;
+        static void Keep(MemoryStream? into, ReadOnlySpan<byte> data)
+        {
+            if (into != null && into.Length < Monitor.PreviewBytes) into.Write(data[..(int)Math.Min(data.Length, Monitor.PreviewBytes - into.Length)]);
+        }
         using (upstream)
         {
             upstream.NoDelay = true;
             var up = upstream.GetStream();
             var prefix = reader.TakeBuffered();
-            if (prefix.Length > 0) { await up.WriteAsync(prefix, ct); flow.BytesSent += prefix.Length; }
-            await PipeAsync(clientStream, up, n => flow.BytesSent += n, n => flow.BytesReceived += n, ct);
+            if (prefix.Length > 0)
+            {
+                recording?.Feed(true, prefix);
+                Keep(sentData, prefix);
+                await up.WriteAsync(prefix, ct);
+                flow.BytesSent += prefix.Length;
+            }
+            var extractor = Extractor;
+            await PipeAsync(clientStream, up,
+                d => { Keep(sentData, d.Span); flow.BytesSent += d.Length; },
+                d =>
+                {
+                    if (recording != null && recording.Feed(false, d.Span)) _ = extractor!.CaptureAsync(recording);
+                    Keep(receivedData, d.Span);
+                    flow.BytesReceived += d.Length;
+                }, ct,
+                beforeSend: recording == null ? null : async d =>
+                {
+                    // Hold the program's first application data until its memory is captured (see KeyExtractor.CaptureAsync).
+                    if (recording.Feed(true, d.Span))
+                        await extractor!.CaptureAsync(recording).WaitAsync(TimeSpan.FromSeconds(3), ct).ContinueWith(_ => { });
+                });
         }
+        if (sentData != null) flow.RequestBody = sentData.ToArray();
+        if (receivedData != null) flow.ResponseBody = receivedData.ToArray();
         flow.DurationMs = started.Elapsed.TotalMilliseconds;
         monitor.Complete(flow);
+        if (recording != null) Extractor?.Closed(recording);
     }
 
-    static async Task PipeAsync(Stream client, Stream server, Action<int> sent, Action<int> received, CancellationToken ct)
+    static Task PipeAsync(Stream client, Stream server, Action<int> sent, Action<int> received, CancellationToken ct) =>
+        PipeAsync(client, server, (ReadOnlyMemory<byte> d) => sent(d.Length), (ReadOnlyMemory<byte> d) => received(d.Length), ct);
+
+    /// <summary>Copies both ways until either side closes; the callbacks see each chunk after it was forwarded.</summary>
+    static async Task PipeAsync(Stream client, Stream server, Action<ReadOnlyMemory<byte>> sent, Action<ReadOnlyMemory<byte>> received, CancellationToken ct,
+                                Func<ReadOnlyMemory<byte>, Task>? beforeSend = null)
     {
         using var done = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        async Task Copy(Stream from, Stream to, Action<int> count)
+        async Task Copy(Stream from, Stream to, Action<ReadOnlyMemory<byte>> count, Func<ReadOnlyMemory<byte>, Task>? before)
         {
             var buffer = new byte[64 * 1024];
             try
@@ -372,14 +505,15 @@ sealed class ProxyServer : IDisposable
                 int n;
                 while ((n = await from.ReadAsync(buffer, done.Token)) > 0)
                 {
+                    if (before != null) await before(buffer.AsMemory(0, n));
                     await to.WriteAsync(buffer.AsMemory(0, n), done.Token);
-                    count(n);
+                    count(buffer.AsMemory(0, n));
                 }
             }
             catch (Exception e) when (e is IOException or OperationCanceledException or ObjectDisposedException or SocketException) { }
             finally { done.Cancel(); }
         }
-        await Task.WhenAll(Copy(client, server, sent), Copy(server, client, received));
+        await Task.WhenAll(Copy(client, server, sent, beforeSend), Copy(server, client, received, null));
     }
 
     // ---- HTTP --------------------------------------------------------------------------------
@@ -467,6 +601,7 @@ sealed class ProxyServer : IDisposable
                 var started = Stopwatch.StartNew();
                 string method = request.Method;
                 string host, pathAndQuery, url;
+                string? shownHost = null;
                 int port;
                 bool tls = target?.TlsName != null;
 
@@ -477,6 +612,7 @@ sealed class ProxyServer : IDisposable
                     pathAndQuery = request.Target;
                     string authority = t.TlsName ?? request.Get("Host") ?? host;
                     if (authority.Contains(':') && !authority.StartsWith('[')) authority = authority[..authority.LastIndexOf(':')];
+                    shownHost = authority;
                     url = $"{(tls ? "https" : "http")}://{authority}{((tls && port == 443) || (!tls && port == 80) ? "" : $":{port}")}{pathAndQuery}";
                 }
                 else if (IsLocal(request, out string? localPath))
@@ -498,7 +634,7 @@ sealed class ProxyServer : IDisposable
                     return;
                 }
 
-                var flow = NewFlow(client, tls ? "https" : "http", host, port);
+                var flow = NewFlow(client, tls ? "https" : "http", shownHost ?? host, port);
                 flow.Method = method;
                 flow.Url = url;
                 monitor.Add(flow);
@@ -526,7 +662,7 @@ sealed class ProxyServer : IDisposable
                 string? requestBodyText = null;
                 string RequestBodyText() => requestBodyText ??= HttpUtil.Text(decodedRequest);
 
-                var rule = ruleSet.MatchMessage(host, method, url, requestText, RequestBodyText);
+                var rule = ruleSet.MatchMessage(shownHost ?? host, method, url, requestText, RequestBodyText);
                 if (rule?.Action == "block")
                 {
                     flow.Outcome = "blocked";
@@ -614,7 +750,7 @@ sealed class ProxyServer : IDisposable
                     var responseBody = await BufferBodyAsync(upstream.Reader, responseFraming, responseLength, ruleSet.MaxInspectBytes, ct);
                     byte[] decoded = HttpUtil.Decode(responseBody.Data, response.Get("Content-Encoding"), ruleSet.MaxInspectBytes);
                     flow.ResponseBody = Monitor.Preview(decoded);
-                    var responseRule = ruleSet.MatchMessage(host, method, url, requestText, RequestBodyText,
+                    var responseRule = ruleSet.MatchMessage(shownHost ?? host, method, url, requestText, RequestBodyText,
                         flow.ResponseHeaders, () => HttpUtil.Text(decoded));
                     if (responseRule?.Action == "block")
                     {
@@ -673,6 +809,8 @@ sealed class ProxyServer : IDisposable
     {
         cts.Cancel();
         listener.Stop();
+        transparent4?.Dispose();
+        transparent6?.Dispose();
     }
 }
 

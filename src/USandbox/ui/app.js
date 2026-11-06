@@ -44,7 +44,7 @@ function splitUrl(f) {
     return { path: u.pathname + u.search, origin: u.origin };
   } catch { return { path: f.url, origin: '' }; }
 }
-const kindLabel = { http: 'HTTP', https: 'HTTPS', tunnel: 'Tunnel', websocket: 'WebSocket', direct: 'Direct', listen: 'Listen' };
+const kindLabel = { http: 'HTTP', https: 'HTTPS', tunnel: 'Tunnel', websocket: 'WebSocket', direct: 'Direct', listen: 'Listen', tcp: 'TCP', 'tls-data': 'TLS data' };
 const outcomeLabel = { allowed: 'allowed', blocked: 'blocked', error: 'error', passthrough: 'not decrypted', pending: '…' };
 
 // ---- messages from the host ----------------------------------------------------
@@ -104,11 +104,13 @@ function fillLauncher(d) {
   $('fNetwork').value = d.network || 'filter';
   $('fTls').checked = d.inspectTls !== false;
   $('fAuto').checked = d.autoPassthrough !== false;
+  $('fKeys').checked = d.extractKeys !== false;
+  $('fPassive').checked = !!d.passiveTls;
   updateNetworkHelp();
 }
 
 const networkHelp = {
-  filter: 'Programs that ignore the proxy settings cannot connect; their attempts are listed as blocked.',
+  filter: 'Every TCP connection is redirected through usandbox, even from programs that ignore proxy settings. UDP and other traffic is blocked and listed.',
   open: 'Programs that ignore the proxy settings can connect directly; their connections are listed, but rules cannot see inside them.',
   off: 'The same as running without usandbox\u2019s network features. Direct TCP connections are still listed.',
   none: 'Everything except loopback is blocked. Attempts are listed.',
@@ -117,8 +119,10 @@ function updateNetworkHelp() {
   const n = $('fNetwork').value;
   $('networkHelp').textContent = networkHelp[n];
   const proxied = n === 'filter' || n === 'open';
-  $('fTls').disabled = $('fAuto').disabled = !proxied;
-  $('tlsNote').hidden = !proxied || !$('fTls').checked;
+  const passive = $('fPassive').checked;
+  $('fKeys').disabled = $('fPassive').disabled = !proxied;
+  $('fTls').disabled = $('fAuto').disabled = !proxied || passive;
+  $('tlsNote').hidden = !proxied || !$('fTls').checked || passive;
 }
 
 function renderSession() {
@@ -140,7 +144,8 @@ function renderSession() {
   const bits = [];
   if (s.user) bits.push(s.user);
   if (s.pid) bits.push(`PID ${s.pid}`);
-  bits.push(`network: ${s.network}${(s.network === 'filter' || s.network === 'open') ? (s.inspectTls ? ', HTTPS decrypted' : ', HTTPS not decrypted') : ''}`);
+  const tls = s.passiveTls ? ', HTTPS from memory keys only' : s.inspectTls ? ', HTTPS decrypted' : ', HTTPS not intercepted';
+  bits.push(`network: ${s.network}${s.transparent ? ' (transparent)' : ''}${(s.network === 'filter' || s.network === 'open') ? tls : ''}`);
   if (s.proxyPort) bits.push(`proxy 127.0.0.1:${s.proxyPort}`);
   if (s.exitCode !== null && s.exitCode !== undefined) bits.push(`exit code ${s.exitCode}`);
   $('meta').textContent = bits.join(' · ');
@@ -285,7 +290,7 @@ function renderDetail() {
   let html = '';
   if (!req) html = '<p class="muted">Loading…</p>';
   else if (!part.headers && !part.body) {
-    html = `<p class="muted">${f.kind === 'tunnel' ? 'This connection was not decrypted, so only its host name is known.'
+    html = `<p class="muted">${f.kind === 'tunnel' ? 'This connection was not decrypted, so only its host name is known (see the note for whether keys were found in memory).'
       : f.kind === 'direct' || f.kind === 'listen' ? 'This connection did not go through the proxy, so its contents are not visible.'
       : state.detailTab === 'res' ? 'No response.' : 'Nothing recorded.'}</p>`;
   } else {
@@ -477,6 +482,7 @@ $('clearBtn').onclick = () => { state.flows.clear(); state.order = []; $('dClose
 $('browseBtn').onclick = () => send({ type: 'browse' });
 $('fNetwork').onchange = updateNetworkHelp;
 $('fTls').onchange = updateNetworkHelp;
+$('fPassive').onchange = updateNetworkHelp;
 $('stopBtn').onclick = () => send({ type: 'stop' });
 $('newBtn').onclick = () => {
   state.session = null;
@@ -495,6 +501,8 @@ $('launchForm').addEventListener('submit', (e) => {
     network: $('fNetwork').value,
     inspectTls: $('fTls').checked,
     autoPassthrough: $('fAuto').checked,
+    extractKeys: $('fKeys').checked,
+    passiveTls: $('fPassive').checked,
   });
 });
 

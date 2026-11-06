@@ -114,6 +114,69 @@ static class Native
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern int QueryDosDeviceW(string? device, StringBuilder target, int max);
 
+    // ---- process memory (TLS key extraction) ---------------------------------------------------
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MEMORY_BASIC_INFORMATION
+    {
+        public IntPtr BaseAddress;
+        public IntPtr AllocationBase;
+        public uint AllocationProtect;
+        public ushort PartitionId;
+        public IntPtr RegionSize;
+        public uint State;
+        public uint Protect;
+        public uint Type;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern int VirtualQueryEx(IntPtr process, IntPtr address, out MEMORY_BASIC_INFORMATION info, int length);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadProcessMemory(IntPtr process, IntPtr address, [Out] byte[] buffer, int size, out IntPtr read);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll")]
+    public static extern int PssCaptureSnapshot(IntPtr process, uint captureFlags, uint threadContextFlags, out IntPtr snapshot);
+
+    [DllImport("kernel32.dll")]
+    public static extern int PssQuerySnapshot(IntPtr snapshot, int informationClass, out IntPtr buffer, int bufferLength);
+
+    [DllImport("kernel32.dll")]
+    public static extern int PssFreeSnapshot(IntPtr process, IntPtr snapshot);
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]   // LUID is two DWORDs: no 8-byte alignment
+    struct TOKEN_PRIVILEGES_1
+    {
+        public int Count;
+        public long Luid;
+        public int Attributes;
+    }
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool LookupPrivilegeValueW(string? system, string name, out long luid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES_1 state, int length, IntPtr previous, IntPtr returned);
+
+    /// <summary>Enables a privilege the process token holds (disabled by default for admins, e.g. SeDebugPrivilege).</summary>
+    public static bool EnablePrivilege(string name)
+    {
+        const int TOKEN_ADJUST_PRIVILEGES = 0x20, SE_PRIVILEGE_ENABLED = 0x2;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out IntPtr token)) return false;
+        try
+        {
+            if (!LookupPrivilegeValueW(null, name, out long luid)) return false;
+            var tp = new TOKEN_PRIVILEGES_1 { Count = 1, Luid = luid, Attributes = SE_PRIVILEGE_ENABLED };
+            // Succeeds even when the privilege is not held; ERROR_NOT_ALL_ASSIGNED says so.
+            return AdjustTokenPrivileges(token, false, ref tp, Marshal.SizeOf<TOKEN_PRIVILEGES_1>(), IntPtr.Zero, IntPtr.Zero) &&
+                   Marshal.GetLastWin32Error() == 0;
+        }
+        finally { CloseHandle(token); }
+    }
+
     // ---- console (the exe is a GUI app; --no-gui borrows or creates a console) -----------------
 
     [DllImport("kernel32.dll")] public static extern bool AttachConsole(int pid);

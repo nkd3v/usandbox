@@ -1,0 +1,23 @@
+{
+  // usandbox rules. Rules are tried from top to bottom; the first one that matches decides.
+  // Every field you set must match. Leave out a field to match anything.
+  //
+  //   action   block | allow | passthrough  (passthrough = do not decrypt HTTPS for this host)
+  //   host     host glob(s): "*.example.com", "a.com b.com"
+  //   url      regular expression matched against the whole URL
+  //   method   GET, POST, ...
+  //   contains case-insensitive text to look for          } content rules: checked on the
+  //   regex    regular expression to look for              } decoded (un-gzipped) message
+  //   target   any | headers | body   (where contains/regex look; default any)
+  //   stage    request | response | both  (default request)
+  "rules": [
+    { "name": "Never send this machine's name", "action": "block", "contains": "MY-PC-NAME" },
+    { "name": "No uploads of private keys", "action": "block", "regex": "-----BEGIN [A-Z ]*PRIVATE KEY-----", "target": "body" },
+    { "name": "Telemetry", "action": "block", "host": "*.telemetry.example.com telemetry.example.net" },
+    { "name": "Allow only GET to the API", "action": "block", "host": "api.example.com", "method": "POST" },
+    { "name": "Pinned app", "action": "passthrough", "host": "*.pinned.example.org" },
+    { "name": "Block pages that ask for a password", "action": "block", "stage": "response", "regex": "(?i)<input[^>]+type=\"?password", "enabled": false }
+  ],
+  // Bodies up to this size are held back and checked before they are passed on.
+  "maxInspectBytes": 8388608
+}

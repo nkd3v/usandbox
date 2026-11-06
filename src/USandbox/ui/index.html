@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>usandbox</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7l8-4 8 4v10l-8 4-8-4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M4 7l8 4 8-4M12 11v10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+      <span>usandbox</span>
+    </div>
+    <div class="session" id="session">
+      <span class="pill idle" id="state">idle</span>
+      <span class="prog" id="prog">No program running</span>
+      <span class="meta" id="meta"></span>
+    </div>
+    <div class="actions">
+      <button class="danger" id="stopBtn" hidden>Stop &amp; clean up</button>
+      <button id="newBtn" hidden>Run another</button>
+    </div>
+  </header>
+
+  <section class="launcher" id="launcher" hidden>
+    <form id="launchForm" autocomplete="off">
+      <h1>Run a program in a throwaway account</h1>
+      <p class="lead">usandbox creates a hidden standard user, runs the program as that user, watches its network traffic, and deletes the account and its profile when the program exits.</p>
+      <label class="field wide">
+        <span>Program</span>
+        <div class="row">
+          <input id="fProgram" placeholder="C:\path\to\program.exe" spellcheck="false" required>
+          <button type="button" id="browseBtn">Browse…</button>
+        </div>
+      </label>
+      <label class="field wide">
+        <span>Arguments</span>
+        <input id="fArgs" placeholder="passed to the program as typed" spellcheck="false">
+      </label>
+      <label class="field wide">
+        <span>Working directory <em>optional</em></span>
+        <input id="fCwd" placeholder="defaults to the program's folder" spellcheck="false">
+      </label>
+      <div class="grid2">
+        <label class="field">
+          <span>Copy the program first</span>
+          <select id="fStage">
+            <option value="none">No, run it where it is</option>
+            <option value="file">Copy the .exe only</option>
+            <option value="folder">Copy its whole folder</option>
+          </select>
+          <small>Needed for programs inside your profile (Downloads, Desktop…), which other accounts cannot read.</small>
+        </label>
+        <label class="field">
+          <span>Network</span>
+          <select id="fNetwork">
+            <option value="filter">Filter: everything goes through the proxy</option>
+            <option value="open">Open: proxy, but direct connections allowed</option>
+            <option value="off">Off: no proxy (direct connections listed)</option>
+            <option value="none">None: no network</option>
+          </select>
+          <small id="networkHelp"></small>
+        </label>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" id="fTls" checked> Decrypt HTTPS so content rules apply to it</label>
+        <label><input type="checkbox" id="fAuto" checked> If a program rejects the certificate, stop decrypting that host</label>
+      </div>
+      <p class="note" id="tlsNote">usandbox makes a new certificate authority for each run. Only the throwaway account trusts it, its private key stays in memory, and it is deleted with the account. Nothing is added to your account's or the machine's certificate stores.</p>
+      <div class="go"><button class="primary" type="submit">Run in sandbox</button></div>
+    </form>
+  </section>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="traffic" class="on">Traffic <b id="cTraffic">0</b></button>
+    <button data-tab="endpoints">Endpoints <b id="cEndpoints">0</b></button>
+    <button data-tab="rules">Rules <b id="cRules">0</b></button>
+    <button data-tab="processes">Processes <b id="cProcesses">0</b></button>
+    <button data-tab="log">Log <b id="cLog">0</b></button>
+  </nav>
+
+  <main>
+    <section class="pane on" id="tab-traffic">
+      <div class="toolbar">
+        <input type="search" id="q" placeholder="Filter: host, URL, process, status…" spellcheck="false">
+        <div class="chips" id="chips">
+          <button data-o="" class="on">All</button>
+          <button data-o="blocked">Blocked <b id="cBlocked">0</b></button>
+          <button data-o="error">Errors <b id="cErrors">0</b></button>
+          <button data-o="passthrough">Not decrypted</button>
+          <button data-o="direct">Direct</button>
+        </div>
+        <label class="follow"><input type="checkbox" id="follow" checked> Follow</label>
+        <button id="clearBtn" title="Clear the list (the log file is kept)">Clear</button>
+      </div>
+      <div class="split">
+        <div class="tablewrap" id="trafficWrap">
+          <table class="grid" id="traffic">
+            <thead><tr><th class="t">Time</th><th>Process</th><th>Type</th><th>Method</th><th>Host</th><th class="path">Path</th><th class="n">Status</th><th class="n">Sent</th><th class="n">Received</th><th>Result</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="empty" id="trafficEmpty">Network activity of the sandboxed program shows up here.</div>
+        </div>
+        <aside class="detail" id="detail" hidden>
+          <div class="dhead">
+            <div class="durl" id="dUrl"></div>
+            <button class="x" id="dClose" title="Close">×</button>
+          </div>
+          <dl class="facts" id="dFacts"></dl>
+          <div class="quick" id="dQuick"></div>
+          <div class="subtabs" id="dTabs">
+            <button data-d="req" class="on">Request</button>
+            <button data-d="res">Response</button>
+          </div>
+          <div class="dbody" id="dBody"></div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="pane" id="tab-endpoints">
+      <div class="toolbar">
+        <input type="search" id="eq" placeholder="Filter endpoints…" spellcheck="false">
+      </div>
+      <div class="tablewrap">
+        <table class="grid" id="endpoints">
+          <thead><tr><th>Endpoint</th><th>Seen as</th><th class="n">Requests</th><th class="n">Blocked</th><th class="n">Sent</th><th class="n">Received</th><th>Processes</th><th class="t">Last seen</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="empty" id="endpointsEmpty">Every host and address the program talks to (or tries to) is summarised here.</div>
+      </div>
+    </section>
+
+    <section class="pane" id="tab-rules">
+      <div class="rules">
+        <div class="rulelist">
+          <div class="toolbar">
+            <span class="hint">Rules are tried from top to bottom; the first match decides. <span id="rulesPath"></span></span>
+          </div>
+          <table class="grid" id="ruleTable">
+            <thead><tr><th>On</th><th>Name</th><th>Action</th><th>Matches</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="empty" id="rulesEmpty">No rules yet: everything is allowed and recorded.</div>
+          <form class="newrule" id="ruleForm" autocomplete="off">
+            <h3>Add a rule</h3>
+            <div class="grid3">
+              <label class="field"><span>Name</span><input id="rName" placeholder="optional"></label>
+              <label class="field"><span>Action</span>
+                <select id="rAction"><option value="block">Block</option><option value="allow">Allow (skip later rules)</option><option value="passthrough">Don't decrypt HTTPS</option></select></label>
+              <label class="field"><span>Host</span><input id="rHost" placeholder="*.example.com" spellcheck="false"></label>
+              <label class="field"><span>URL regex</span><input id="rUrl" placeholder="/upload|/v1/telemetry" spellcheck="false"></label>
+              <label class="field"><span>Method</span><input id="rMethod" placeholder="POST" spellcheck="false"></label>
+              <label class="field"><span>Contains text</span><input id="rContains" placeholder="password=" spellcheck="false"></label>
+              <label class="field"><span>Or regex</span><input id="rRegex" placeholder="(?i)secret" spellcheck="false"></label>
+              <label class="field"><span>Look in</span>
+                <select id="rTarget"><option value="any">Headers and body</option><option value="headers">Headers</option><option value="body">Body</option></select></label>
+              <label class="field"><span>Check</span>
+                <select id="rStage"><option value="request">What the program sends</option><option value="response">What it receives</option><option value="both">Both</option></select></label>
+            </div>
+            <div class="go"><button class="primary" type="submit">Add rule</button></div>
+          </form>
+        </div>
+        <div class="rulejson">
+          <div class="toolbar"><b>rules.json</b><span class="grow"></span><button id="ruleReload">Revert</button><button class="primary" id="ruleSave">Save</button></div>
+          <textarea id="ruleText" spellcheck="false"></textarea>
+          <div class="msg" id="ruleMsg"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="pane" id="tab-processes">
+      <div class="tablewrap">
+        <table class="grid" id="processes">
+          <thead><tr><th class="n">PID</th><th>Name</th><th>Path</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="empty" id="processesEmpty">Processes running as the throwaway account are listed here.</div>
+      </div>
+    </section>
+
+    <section class="pane" id="tab-log">
+      <div class="log" id="log"></div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>
